@@ -1,0 +1,19 @@
+{
+  "name": "nostr2gh",
+  "version": "0.1.0",
+  "description": "Relay NIP-34 pull requests and patches from Nostr to GitHub",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "nostr2gh": "./nostr2gh.mjs"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.25.2"
+  }
+}
