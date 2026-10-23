@@ -62,6 +62,16 @@ commit). Kind 1619 updates from the same author force-push the branch and leave
 a comment. `state.json` next to the config remembers what was relayed; delete an
 entry to redo it. `--event <id|file.json>` relays one event only.
 
+PRs opened in the gittr.space web UI work too. The UI may tag the *target*
+repo's clone URL, so the relay also tries the clone URLs from the author's own
+repo announcement with the same name. To relay PRs the contributor opens on
+their own fork announcement, add a second `repos` entry with that `a`
+(`30617:<their-hex>:walletwasabi`) and the same `local`/`upstream`. If an open
+upstream PR from `pushOwner` already carries the head commit (for example one
+carried by hand), the relay adopts it instead of opening a duplicate, and later
+updates force-push to that PR's branch. `--dry-run` fetches the head commit into
+`local` to prove it is reachable, but writes nothing to GitHub.
+
 Only npubs listed in `authors` are relayed. Everything else is ignored, so a
 stranger cannot open PRs under your GitHub name. Writes are paced
 (`maxWritesPerRun`, `sleepMs`) and the run aborts if `gh api user` fails.

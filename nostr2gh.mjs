@@ -60,7 +60,7 @@ async function send() {
   if (remoteTip !== commit) console.error(`warning: ${clone} ${branch} is at ${remoteTip || 'nothing'}, not ${commit}; push first or the relay cannot fetch it`);
 
   const tags = [['a', repoRef.a], ['p', repoRef.pubkey]];
-  if (euc) tags.push(['r', euc]);
+  if (euc) tags.push(['r', euc, 'euc']);
   let kind = KIND_PR;
   if (args.update) {
     kind = KIND_PR_UPDATE;
@@ -102,7 +102,7 @@ async function relay() {
     const local = expand(repo.local);
     const filter = { kinds: [KIND_PR, KIND_PR_UPDATE, KIND_PATCH], '#a': [ref.a] };
     let events = await pool.querySync(relays, filter, { maxWait: 10000 });
-    if (args.event) events = existsSync(args.event) ? [JSON.parse(readFileSync(args.event, 'utf8'))] : events.filter(e => e.id === hex(args.event));
+    if (args.event) events = existsSync(args.event) ? [JSON.parse(readFileSync(args.event, 'utf8'))].filter(e => e.tags.some(t => t[0] === 'a' && t[1] === ref.a)) : events.filter(e => e.id === hex(args.event));
     events.sort((a, b) => a.created_at - b.created_at);
     console.log(`${ref.a}: ${events.length} event(s)`);
 
@@ -120,7 +120,7 @@ async function relay() {
         if (writes >= maxWrites) { console.log('  write budget spent'); break; }
         console.log(`  update ${root.url} -> ${tags.c}`);
         if (!dry) {
-          fetchCommit(local, cloneUrls(ev), tags.c);
+          fetchCommit(local, await cloneUrls(ev, ref), tags.c);
           git(['push', '--force-with-lease', repo.push || 'origin', `${tags.c}:refs/heads/${root.branch}`], local);
           sh('gh', ['pr', 'comment', root.url, '--body', `Updated from Nostr by the author (${who}): head is now ${tags.c}.\nNostr event: ${nevent(ev)}`]);
           Object.assign(root, { head: tags.c, updatedAt: ev.created_at });
@@ -132,41 +132,47 @@ async function relay() {
       if (state[ev.id]) continue;
       if (writes >= maxWrites) { console.log('  write budget spent'); break; }
       const subject = tags.subject || firstLine(ev.content) || `Nostr PR ${ev.id.slice(0, 8)}`;
-      const branch = `nostr/${slug(who)}/${slug(tags['branch-name'] || ev.id.slice(0, 12))}`;
+      let branch = `nostr/${slug(who)}/${slug(tags['branch-name'] || ev.id.slice(0, 12))}`;
       let head = tags.c;
       console.log(`  new ${ev.kind === KIND_PATCH ? 'patch' : 'PR'} from ${who}: "${subject}" -> ${repo.upstream} ${branch}`);
-      if (dry) continue;
+      const urls = ev.kind === KIND_PATCH ? [] : await cloneUrls(ev, ref);
+      if (ev.kind !== KIND_PATCH) fetchCommit(local, urls, head);
+      if (dry) { console.log(`  head ${head} fetched from ${urls.join(' or ') || 'patch'}`); continue; }
 
       if (ev.kind === KIND_PATCH) head = applyPatch(local, repo, ev);
-      else fetchCommit(local, cloneUrls(ev), head);
       const base = pickBase(local, repo, tags['merge-base']);
-      git(['push', repo.push || 'origin', `${head}:refs/heads/${branch}`], local);
-
-      const headRef = `${repo.pushOwner}:${branch}`;
-      const existing = JSON.parse(sh('gh', ['pr', 'list', '-R', repo.upstream, '--head', headRef, '--state', 'all', '--json', 'url', '-L', '1']));
+      // An open PR already carries this commit (relayed before, or carried by hand):
+      // adopt it, so later 1619 updates force-push to its branch instead of opening a duplicate.
+      const [carried] = JSON.parse(sh('gh', ['pr', 'list', '-R', repo.upstream, '--search', head, '--state', 'open', '--json', 'url,headRefName,headRepositoryOwner', '-L', '1']));
       let url;
-      if (existing.length) url = existing[0].url;
-      else {
+      if (carried && carried.headRepositoryOwner.login === repo.pushOwner) {
+        url = carried.url; branch = carried.headRefName;
+      } else {
+        git(['push', repo.push || 'origin', `${head}:refs/heads/${branch}`], local);
         const body = `${ev.content.slice(0, 60000)}\n\n---\n` +
           `Relayed from Nostr on behalf of ${who} (${nip19.npubEncode(ev.pubkey)}), who cannot currently post on GitHub. ` +
           `The commits are the author's, unchanged.\n` +
           `Nostr ${ev.kind === KIND_PATCH ? 'patch' : 'PR'}: ${nevent(ev)}\n` +
           `https://gittr.space/${nip19.npubEncode(ref.pubkey)}/${ref.d}/pulls/${ev.id}\n` +
-          `Head: ${head}${ev.kind === KIND_PATCH ? ' (applied with git am)' : ` from ${cloneUrls(ev)[0]}`}`;
+          `Head: ${head}${ev.kind === KIND_PATCH ? ' (applied with git am)' : ` from ${urls[0]}`}`;
         const bodyFile = join(dirname(statePath), `body-${ev.id.slice(0, 8)}.md`);
         writeFileSync(bodyFile, body);
-        url = sh('gh', ['pr', 'create', '-R', repo.upstream, '--base', base, '--head', headRef, '--title', subject.slice(0, 250), '--body-file', bodyFile]).trim().split('\n').pop();
+        url = sh('gh', ['pr', 'create', '-R', repo.upstream, '--base', base, '--head', `${repo.pushOwner}:${branch}`, '--title', subject.slice(0, 250), '--body-file', bodyFile]).trim().split('\n').pop();
       }
       state[ev.id] = { url, branch, head, base, author: ev.pubkey, updatedAt: ev.created_at };
       saveState(statePath, state); writes++;
-      console.log(`  opened ${url}`);
+      console.log(`  ${carried ? 'adopted' : 'opened'} ${url}`);
       await sleep(cfg.sleepMs ?? 30000);
     }
   }
 }
 
-function cloneUrls(ev) {
-  const urls = ev.tags.filter(t => t[0] === 'clone').flatMap(t => t.slice(1)).filter(u => /^https?:\/\//.test(u));
+// The event's own clone URLs first, then the author's repo announcements with the
+// same d-tag: gittr's web UI falls back to the *target* repo's clone URL, which
+// does not have the contributor's commits.
+async function cloneUrls(ev, ref) {
+  const own = await pool.querySync(DEFAULT_RELAYS, { kinds: [KIND_REPO], authors: [ev.pubkey], '#d': [ref.d] }, { maxWait: 8000 });
+  const urls = uniq([ev, ...own].flatMap(e => e.tags.filter(t => t[0] === 'clone').flatMap(t => t.slice(1))).filter(u => /^https?:\/\//.test(u)));
   if (!urls.length) die(`event ${ev.id} has no https clone URL`);
   return urls;
 }
